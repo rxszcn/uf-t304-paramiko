@@ -2199,6 +2199,97 @@ class Transport(threading.Thread, ClosingContextManager):
             msg += "local={}, remote={}".format(local, remote)
         self._log(DEBUG, msg)
 
+    @staticmethod
+    def _strip_kex_markers(algorithms):
+        # Handshake-internal markers (ext-info-*, kex-strict-*) are not
+        # algorithms; they must never show up in reported offer lists. Also
+        # drop the empty string, which is how SSH "namelists" decode when a
+        # peer offers nothing at all.
+        return tuple(
+            algo
+            for algo in algorithms
+            if algo
+            and not (
+                algo.startswith("ext-info-") or algo.startswith("kex-strict-")
+            )
+        )
+
+    @staticmethod
+    def _directional_offers(preferred, remote_c2s, remote_s2c):
+        """
+        Build the ordered, role-independent offer report for a directional
+        stage (ciphers, macs, compression).
+
+        KEXINIT carries one list *per direction*, not per role: the
+        ``client->server`` field names are the same regardless of which end
+        sends them. We always advertise our preference list verbatim in both
+        of our fields, so our offer is identical for both directions; only
+        the peer's two fields differ.
+        """
+        local = tuple(preferred)
+        return (
+            ("client->server", local, tuple(remote_c2s)),
+            ("server->client", local, tuple(remote_s2c)),
+        )
+
+    def _raise_incompatible_peer(
+        self, message, stage, local=(), remote=(), directions=None
+    ):
+        """
+        Raise `.IncompatiblePeer` carrying structured, per-stage diagnostics.
+
+        ``local`` is what this transport offered, in its own preference
+        order; ``remote`` is what the peer offered, in peer order. For the
+        directional stages (ciphers/macs/compression) pass ``directions``
+        instead: an ordered sequence of ``(direction, local, remote)``
+        triples using role-independent ``client->server`` /
+        ``server->client`` names, so a client and a server describe the same
+        connection identically. Single-list stages (kex/keys) pass
+        ``local``/``remote`` only.
+
+        Whatever is supplied also gets logged, so the failure is visible in
+        the negotiation log without a packet capture.
+        """
+        local = self._strip_kex_markers(local)
+        remote = self._strip_kex_markers(remote)
+        if directions is not None:
+            cleaned = []
+            for name, local_list, remote_list in directions:
+                local_list = self._strip_kex_markers(local_list)
+                remote_list = self._strip_kex_markers(remote_list)
+                cleaned.append((name, local_list, remote_list))
+                self._log(
+                    DEBUG,
+                    "KEX failure ({}/{}): local={}, remote={}".format(
+                        stage,
+                        name,
+                        local_list,
+                        remote_list,
+                    ),
+                )
+            # Mirror the first direction whose offers did not intersect.
+            for name, local_list, remote_list in cleaned:
+                if not set(local_list) & set(remote_list):
+                    local, remote = local_list, remote_list
+                    break
+            else:
+                local, remote = cleaned[0][1], cleaned[0][2]
+            directions = cleaned
+        else:
+            self._log(
+                DEBUG,
+                "KEX failure ({}): local={}, remote={}".format(
+                    stage, local, remote
+                ),
+            )
+        raise IncompatiblePeer(
+            message,
+            stage=stage,
+            local_algorithms=local,
+            remote_algorithms=remote,
+            directions=directions,
+        )
+
     # protocol stages
 
     def _negotiate_keys(self, m):
@@ -2436,11 +2527,11 @@ class Transport(threading.Thread, ClosingContextManager):
                 filter(kex_algo_list.__contains__, self.preferred_kex)
             )
         if len(agreed_kex) == 0:
-            # TODO: do an auth-overhaul style aggregate exception here?
-            # TODO: would let us streamline log output & show all failures up
-            # front
-            raise IncompatiblePeer(
-                "Incompatible ssh peer (no acceptable kex algorithm)"
+            self._raise_incompatible_peer(
+                "Incompatible ssh peer (no acceptable kex algorithm)",
+                "kex",
+                local=self.preferred_kex,
+                remote=kex_algo_list,
             )  # noqa
         self.kex_engine = self._kex_info[agreed_kex[0]](self)
         self._log(DEBUG, "Kex: {}".format(agreed_kex[0]))
@@ -2457,18 +2548,28 @@ class Transport(threading.Thread, ClosingContextManager):
                     available_server_keys.__contains__, server_key_algo_list
                 )
             )
+            local_key_algos = available_server_keys
         else:
             agreed_keys = list(
                 filter(server_key_algo_list.__contains__, self.preferred_keys)
             )
+            local_key_algos = self.preferred_keys
         if len(agreed_keys) == 0:
-            raise IncompatiblePeer(
-                "Incompatible ssh peer (no acceptable host key)"
+            self._raise_incompatible_peer(
+                "Incompatible ssh peer (no acceptable host key)",
+                "keys",
+                local=local_key_algos,
+                remote=server_key_algo_list,
             )  # noqa
         self.host_key_type = agreed_keys[0]
         if self.server_mode and (self.get_server_key() is None):
-            raise IncompatiblePeer(
-                "Incompatible ssh peer (can't match requested host key type)"
+            # Offer lists agree, but we hold no usable private key of the
+            # agreed type; still report both sides' host key offers.
+            self._raise_incompatible_peer(
+                "Incompatible ssh peer (can't match requested host key type)",
+                "keys",
+                local=local_key_algos,
+                remote=server_key_algo_list,
             )  # noqa
         self._log_agreement("HostKey", agreed_keys[0], agreed_keys[0])
 
@@ -2499,8 +2600,14 @@ class Transport(threading.Thread, ClosingContextManager):
                 )
             )
         if len(agreed_local_ciphers) == 0 or len(agreed_remote_ciphers) == 0:
-            raise IncompatiblePeer(
-                "Incompatible ssh server (no acceptable ciphers)"
+            self._raise_incompatible_peer(
+                "Incompatible ssh server (no acceptable ciphers)",
+                "ciphers",
+                directions=self._directional_offers(
+                    self.preferred_ciphers,
+                    client_encrypt_algo_list,
+                    server_encrypt_algo_list,
+                ),
             )  # noqa
         self.local_cipher = agreed_local_ciphers[0]
         self.remote_cipher = agreed_remote_ciphers[0]
@@ -2523,8 +2630,14 @@ class Transport(threading.Thread, ClosingContextManager):
                 filter(server_mac_algo_list.__contains__, self.preferred_macs)
             )
         if (len(agreed_local_macs) == 0) or (len(agreed_remote_macs) == 0):
-            raise IncompatiblePeer(
-                "Incompatible ssh server (no acceptable macs)"
+            self._raise_incompatible_peer(
+                "Incompatible ssh server (no acceptable macs)",
+                "macs",
+                directions=self._directional_offers(
+                    self.preferred_macs,
+                    client_mac_algo_list,
+                    server_mac_algo_list,
+                ),
             )
         self.local_mac = agreed_local_macs[0]
         self.remote_mac = agreed_remote_macs[0]
@@ -2562,14 +2675,18 @@ class Transport(threading.Thread, ClosingContextManager):
             len(agreed_local_compression) == 0
             or len(agreed_remote_compression) == 0
         ):
-            msg = "Incompatible ssh server (no acceptable compression)"
-            msg += " {!r} {!r} {!r}"
-            raise IncompatiblePeer(
-                msg.format(
-                    agreed_local_compression,
-                    agreed_remote_compression,
+            # NOTE: this stage previously reported the /intersected/ results
+            # plus only our own preference list, which told operators nothing
+            # about what the peer offered. Use the same reporting shape as
+            # every other stage.
+            self._raise_incompatible_peer(
+                "Incompatible ssh server (no acceptable compression)",
+                "compression",
+                directions=self._directional_offers(
                     self.preferred_compression,
-                )
+                    client_compress_algo_list,
+                    server_compress_algo_list,
+                ),
             )
         self.local_compression = agreed_local_compression[0]
         self.remote_compression = agreed_remote_compression[0]

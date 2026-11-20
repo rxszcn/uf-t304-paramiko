@@ -145,15 +145,105 @@ class IncompatiblePeer(SSHException):
     A disagreement arose regarding an algorithm required for key exchange.
 
     .. versionadded:: 2.9
+
+    .. versionchanged:: 5.2
+        Failures raised by the KEXINIT cross-check now carry structured
+        diagnostics describing *which* negotiation stage failed and *what*
+        each end offered for it, so diagnosis no longer requires a packet
+        capture:
+
+        - ``stage``: one of ``"kex"``, ``"keys"``, ``"ciphers"``, ``"macs"``
+          or ``"compression"`` (matching the keys accepted by
+          ``Transport(disabled_algorithms=...)``); ``None`` when the
+          exception was raised outside the KEXINIT cross-check.
+        - ``local_algorithms``: tuple of the algorithm names *this*
+          transport offered for the stage, in its own preference order.
+        - ``remote_algorithms``: tuple of the algorithm names the *peer*
+          offered for the stage, in the order the peer advertised them. For
+          the directional stages (ciphers, macs, compression) both
+          attributes mirror the first direction whose offers do not
+          intersect; see ``directions`` for the complete picture.
+        - ``directions``: ``None`` for the single-list stages (kex, keys),
+          otherwise an ordered tuple of ``(direction, local, remote)``
+          triples, where ``direction`` is ``"client->server"`` or
+          ``"server->client"``. Direction names are role independent, so
+          they mean the same thing on both ends of the connection.
+        - ``summary``: the legacy one-line reason, preserved verbatim at the
+          front of the rendered message.
+
+        Handshake-internal markers that merely look like algorithms, i.e.
+        names prefixed with ``ext-info-`` or ``kex-strict-``, are never
+        included in the tuples above nor in the rendered message.
+
+        The rendered message appends the structured detail to the legacy
+        one-liner, using one identical shape for every stage, e.g.
+        ``Incompatible ssh peer (no acceptable kex algorithm): stage=kex
+        local=[...] remote=[...]``. For directional stages each failing
+        direction is reported as ``<direction> local=[...] remote=[...]``.
     """
 
-    # TODO (backwards incompat): consider making this annotate w/ 1..N
-    # 'missing' algorithms, either just the first one that would halt kex, or
-    # even updating the Transport logic so we record /all/ that /could/ halt
-    # kex.
-    # TODO: update docstrings where this may end up raised so they are more
-    # specific.
-    pass
+    def __init__(
+        self,
+        message=None,
+        *,
+        stage=None,
+        local_algorithms=(),
+        remote_algorithms=(),
+        directions=None,
+    ):
+        self.stage = stage
+        self.local_algorithms = tuple(local_algorithms)
+        self.remote_algorithms = tuple(remote_algorithms)
+        # (direction, local, remote) triples; None for single-list stages.
+        self.directions = (
+            None
+            if directions is None
+            else tuple(
+                (name, tuple(local), tuple(remote))
+                for (name, local, remote) in directions
+            )
+        )
+        self.summary = message
+        detail = self._format_detail()
+        if detail:
+            if message is None:
+                message = detail
+            else:
+                message = "{}: {}".format(message, detail)
+        SSHException.__init__(self, message)
+
+    @staticmethod
+    def _format_list(algorithms):
+        if not algorithms:
+            return "[]"
+        return "[{}]".format(", ".join(algorithms))
+
+    def _format_detail(self):
+        # Single, shared shape for all stages so log scraping / test
+        # assertions don't need per-stage special cases.
+        if self.stage is None:
+            return ""
+        parts = []
+        for name, local, remote in self.directions or ():
+            if set(local) & set(remote):
+                # This direction actually had a usable overlap; only the
+                # direction(s) which failed are interesting.
+                continue
+            parts.append(
+                "{} local={} remote={}".format(
+                    name,
+                    self._format_list(local),
+                    self._format_list(remote),
+                )
+            )
+        if not parts:
+            parts.append(
+                "local={} remote={}".format(
+                    self._format_list(self.local_algorithms),
+                    self._format_list(self.remote_algorithms),
+                )
+            )
+        return "stage={} {}".format(self.stage, "; ".join(parts))
 
 
 class ProxyCommandFailure(SSHException):

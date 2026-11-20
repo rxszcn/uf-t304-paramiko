@@ -60,6 +60,7 @@ from paramiko.common import (
     MSG_USERAUTH_SUCCESS,
     byte_chr,
     cMSG_CHANNEL_WINDOW_ADJUST,
+    cMSG_KEXINIT,
     cMSG_UNIMPLEMENTED,
 )
 from paramiko.message import Message
@@ -1428,3 +1429,300 @@ class TestStrictKex:
                 transport_factory=RolloverTransport,
             ):
                 pass  # kexinit happens at connect...
+
+
+class KexFailureDiagnosticsMixin:
+    """
+    Shared plumbing for the KEXINIT cross-check failure-diagnostic tests.
+
+    Rather than driving a real handshake, these build a `Transport` and feed
+    `_parse_kex_init` a KEXINIT `Message` whose offer lists are hand-written:
+    that is the smallest input which reaches the cross-check.
+    """
+
+    server_mode = False
+
+    def make_transport(self, server_mode=None):
+        if server_mode is None:
+            server_mode = self.server_mode
+        t = Transport(sock=Mock())
+        t.server_mode = server_mode
+        # Tests assert on payloads, not log output.
+        t._log = Mock()
+        # Server mode needs at least one host key it can actually use.
+        t.add_server_key(RSAKey.from_private_key_file(_support("rsa.key")))
+        return t
+
+    def kexinit(
+        self,
+        kex,
+        keys,
+        ciphers,
+        macs,
+        compression,
+        ciphers_s2c=None,
+        macs_s2c=None,
+        compression_s2c=None,
+    ):
+        # Directional stages carry two lists; default the "server->client"
+        # one to the same value so most tests need only pass one.
+        if ciphers_s2c is None:
+            ciphers_s2c = ciphers
+        if macs_s2c is None:
+            macs_s2c = macs
+        if compression_s2c is None:
+            compression_s2c = compression
+        m = Message()
+        m.add_byte(cMSG_KEXINIT)
+        m.add_bytes(b"\x00" * 16)
+        m.add_list(kex)
+        m.add_list(keys)
+        m.add_list(ciphers)  # client->server ciphers
+        m.add_list(ciphers_s2c)  # server->client ciphers
+        m.add_list(macs)  # client->server macs
+        m.add_list(macs_s2c)  # server->client macs
+        m.add_list(compression)  # client->server compression
+        m.add_list(compression_s2c)  # server->client compression
+        m.add_list([""])
+        m.add_list([""])
+        m.add_boolean(False)
+        m.add_int(0)
+        # Strict-kex seqno check wants an int here; these tests are not
+        # exercising Terrapin protection.
+        m.seqno = 0
+        # _parse_kex_init is called by the dispatcher /after/ the message type
+        # byte has been consumed, so mirror that here.
+        m.rewind()
+        m.get_byte()
+        return m
+
+    def offers(
+        self, kex=None, keys=None, ciphers=None, macs=None, compression=None
+    ):
+        # Sensible defaults: everything negotiates, so a test can break
+        # exactly one stage and be sure that's the one being reported.
+        return dict(
+            kex=["ecdh-sha2-nistp256"] if kex is None else kex,
+            keys=["rsa-sha2-512"] if keys is None else keys,
+            ciphers=["aes128-ctr"] if ciphers is None else ciphers,
+            macs=["hmac-sha2-256"] if macs is None else macs,
+            compression=["none"] if compression is None else compression,
+        )
+
+
+class TestKexFailureDiagnostics(KexFailureDiagnosticsMixin):
+    """
+    Every one of the five negotiation stages must, on failure, say which
+    stage failed and what each side offered -- no packet capture required.
+    """
+
+    def assert_diagnostic(self, err, stage, remote):
+        assert isinstance(err, IncompatiblePeer)
+        assert err.stage == stage
+        # Handshake-internal markers never leak into reported lists.
+        for algo in err.local_algorithms + err.remote_algorithms:
+            assert not algo.startswith("ext-info-")
+            assert not algo.startswith("kex-strict-")
+        # The legacy one-liner survives as the summary / message prefix.
+        assert err.summary in str(err)
+        assert "stage={}".format(stage) in str(err)
+        for algo in remote:
+            assert algo in err.remote_algorithms
+
+    def parse_failure(self, server_mode=False, **offers):
+        t = self.make_transport(server_mode)
+        with raises(IncompatiblePeer) as info:
+            t._parse_kex_init(self.kexinit(**self.offers(**offers)))
+        return t, info.value
+
+    def test_kex_stage(self):
+        t, err = self.parse_failure(kex=["bogus-kex"])
+        self.assert_diagnostic(err, "kex", ["bogus-kex"])
+        assert err.local_algorithms == t.preferred_kex
+        assert err.remote_algorithms == ("bogus-kex",)
+        # Single-list stage: no directional breakdown.
+        assert err.directions is None
+
+    def test_host_key_stage(self):
+        t, err = self.parse_failure(keys=["bogus-hostkey"])
+        self.assert_diagnostic(err, "keys", ["bogus-hostkey"])
+        assert err.local_algorithms == t.preferred_keys
+        assert err.directions is None
+
+    def test_cipher_stage(self):
+        t, err = self.parse_failure(ciphers=["bogus-cipher"])
+        self.assert_diagnostic(err, "ciphers", ["bogus-cipher"])
+        # Directional stage: both directions reported, role-independent names.
+        assert [d[0] for d in err.directions] == [
+            "client->server",
+            "server->client",
+        ]
+        assert err.directions[0][1] == t.preferred_ciphers
+        assert err.directions[0][2] == ("bogus-cipher",)
+
+    def test_directional_lists_not_swapped(self):
+        # Only the c->s direction is unusable: s->c offers overlap fine.
+        # The report must keep each peer list attached to its own direction.
+        t = self.make_transport()
+        with raises(IncompatiblePeer) as info:
+            t._parse_kex_init(
+                self.kexinit(
+                    **dict(
+                        self.offers(ciphers=["bogus-cipher"]),
+                        ciphers_s2c=["aes128-ctr"],
+                    )
+                )
+            )
+        err = info.value
+        by_direction = {
+            name: (local, remote) for name, local, remote in err.directions
+        }
+        assert by_direction["client->server"] == (
+            t.preferred_ciphers,
+            ("bogus-cipher",),
+        )
+        assert by_direction["server->client"] == (
+            t.preferred_ciphers,
+            ("aes128-ctr",),
+        )
+        # Only the failing direction appears in the rendered message.
+        rendered = str(err)
+        assert "client->server local=" in rendered
+        assert "server->client" not in rendered
+        # The mirrored top-level pair is the failing direction's, not the
+        # working one's.
+        assert err.remote_algorithms == ("bogus-cipher",)
+
+    def test_mac_stage(self):
+        _, err = self.parse_failure(macs=["bogus-mac"])
+        self.assert_diagnostic(err, "macs", ["bogus-mac"])
+        assert err.remote_algorithms == ("bogus-mac",)
+
+    def test_compression_stage(self):
+        _, err = self.parse_failure(compression=["bogus-compression"])
+        # Previously this stage echoed only the (empty) intersection plus our
+        # own preference list -- never the peer's actual offer.
+        self.assert_diagnostic(err, "compression", ["bogus-compression"])
+        assert "bogus-compression" in str(err)
+        assert [d[0] for d in err.directions] == [
+            "client->server",
+            "server->client",
+        ]
+
+    def test_successful_negotiation_raises_nothing(self):
+        t = self.make_transport()
+        t._parse_kex_init(self.kexinit(**self.offers()))
+        assert t.local_cipher == t.remote_cipher == "aes128-ctr"
+        assert t.local_mac == t.remote_mac == "hmac-sha2-256"
+        assert t.local_compression == t.remote_compression == "none"
+        assert t.host_key_type == "rsa-sha2-512"
+
+    def test_markers_stripped_from_reported_lists(self):
+        _, err = self.parse_failure(
+            kex=[
+                "ext-info-s",
+                "kex-strict-s-v00@openssh.com",
+                "bogus-kex",
+            ]
+        )
+        assert err.remote_algorithms == ("bogus-kex",)
+        assert "ext-info-s" not in str(err)
+        assert "kex-strict-s-v00@openssh.com" not in str(err)
+
+    def test_role_swap_keeps_list_ownership(self):
+        # Same broken peer offer, read once as client and once as server.
+        # Each side must report its own list as local, the peer's as remote,
+        # and use the same direction names for the same connection.
+        as_client = self.make_transport(server_mode=False)
+        as_server = self.make_transport(server_mode=True)
+        offers = self.offers(macs=["bogus-mac"])
+        with raises(IncompatiblePeer) as client_info:
+            as_client._parse_kex_init(self.kexinit(**offers))
+        with raises(IncompatiblePeer) as server_info:
+            as_server._parse_kex_init(self.kexinit(**offers))
+
+        client_err, server_err = client_info.value, server_info.value
+        assert client_err.local_algorithms == as_client.preferred_macs
+        assert server_err.local_algorithms == as_server.preferred_macs
+        # The peer's offer is reported identically by both readers.
+        assert client_err.remote_algorithms == ("bogus-mac",)
+        assert server_err.remote_algorithms == ("bogus-mac",)
+        assert [d[0] for d in client_err.directions] == [
+            d[0] for d in server_err.directions
+        ]
+
+    def test_server_role_direction_lists_not_swapped(self):
+        # Server role, same asymmetric peer offers as the client-side test:
+        # c->s unusable, s->c fine. The server must still attribute each
+        # peer list to the direction it was actually advertised for, i.e.
+        # the two roles must not read the same KEXINIT differently.
+        as_client = self.make_transport(server_mode=False)
+        as_server = self.make_transport(server_mode=True)
+        offers = dict(
+            self.offers(ciphers=["bogus-cipher"]),
+            ciphers_s2c=["aes128-ctr"],
+        )
+        with raises(IncompatiblePeer) as client_info:
+            as_client._parse_kex_init(self.kexinit(**offers))
+        with raises(IncompatiblePeer) as server_info:
+            as_server._parse_kex_init(self.kexinit(**offers))
+
+        def by_direction(err):
+            return {
+                name: (local, remote) for name, local, remote in err.directions
+            }
+
+        client_dirs = by_direction(client_info.value)
+        server_dirs = by_direction(server_info.value)
+        # Same peer attribution in both roles, despite the internal
+        # client/server list variables being read the other way round.
+        assert client_dirs["client->server"][1] == ("bogus-cipher",)
+        assert server_dirs["client->server"][1] == ("bogus-cipher",)
+        assert client_dirs["server->client"][1] == ("aes128-ctr",)
+        assert server_dirs["server->client"][1] == ("aes128-ctr",)
+        # And each side's own list is its own preference list.
+        assert client_dirs["client->server"][0] == as_client.preferred_ciphers
+        assert server_dirs["client->server"][0] == as_server.preferred_ciphers
+
+    def test_legacy_summary_texts_unchanged(self):
+        # Log scrapers and downstream callers match on these exact strings.
+        expected = {
+            "kex": "Incompatible ssh peer (no acceptable kex algorithm)",
+            "keys": "Incompatible ssh peer (no acceptable host key)",
+            "ciphers": "Incompatible ssh server (no acceptable ciphers)",
+            "macs": "Incompatible ssh server (no acceptable macs)",
+            "compression": "Incompatible ssh server (no acceptable compression)",
+        }
+        breakage = {
+            "kex": dict(kex=["bogus-kex"]),
+            "keys": dict(keys=["bogus-hostkey"]),
+            "ciphers": dict(ciphers=["bogus-cipher"]),
+            "macs": dict(macs=["bogus-mac"]),
+            "compression": dict(compression=["bogus-compress"]),
+        }
+        for stage, broken in breakage.items():
+            _, err = self.parse_failure(**broken)
+            assert err.stage == stage
+            assert err.summary == expected[stage]
+            assert str(err).startswith(expected[stage])
+
+    def test_initial_and_renegotiation_report_identically(self):
+        # The same cross-check runs on the first KEXINIT and on rekey; the
+        # payload semantics must not depend on which one it was.
+        t = self.make_transport()
+        offers = self.offers(macs=["bogus-mac"])
+        with raises(IncompatiblePeer) as first:
+            t._parse_kex_init(self.kexinit(**offers))
+        failure_open = first.value
+        # Post-NEWKEYS state: initial kex done, seqnos advanced.
+        t.initial_kex_done = True
+        with raises(IncompatiblePeer) as rekey:
+            t._parse_kex_init(self.kexinit(**offers))
+        a, b = failure_open, rekey.value
+        assert (a.stage, a.local_algorithms, a.remote_algorithms) == (
+            b.stage,
+            b.local_algorithms,
+            b.remote_algorithms,
+        )
+        assert a.directions == b.directions
+        assert str(a) == str(b)
